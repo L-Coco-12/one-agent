@@ -250,6 +250,72 @@ curl.exe -N "http://127.0.0.1:8000/api/chat/stream?message=我偏好用什么语
 Web 页面上就是"新建会话"后再问——同一个后端进程内记忆是共享的。
 重启后端进程记忆会清空；要跨进程保留，把 `_build_store()` 换成持久化 store 即可。
 
+## RAG 知识库（离线索引流水线）
+
+RAG 分三段：**① 加载与质检 → ② 切分 → ③ 向量化写入向量库**。当前已完成 ① ② ③：
+
+| 步骤 | 脚本 | 输入 | 输出 |
+|---|---|---|---|
+| ① 加载质检 | `scripts/inspect_docs.py` | `knowledge/` 下的 md/txt/pdf | `.rag/extracted/` + `.rag/extraction_report.json` |
+| ② 切分 | `scripts/inspect_chunks.py` | 同上（直接读原文） | `.rag/chunks/*.jsonl` + `.rag/chunks_report.json` |
+| ③ 向量化 | `scripts/build_rag_index.py` | `.rag/chunks/` | Chroma（docker 服务 + `.rag/chroma` 数据目录）+ `.rag/index_manifest.json` |
+| ③ 检索验证 | `scripts/search_docs.py` | 一句话 | top-k chunk（带 source/section/score） |
+
+**原始资料 vs 生成物**：`knowledge/` 进 git（Source of Truth）；`.rag/` 全部是生成物，已在 `.gitignore` 中，删掉可随时重建。
+
+### ① 加载与质检
+
+```bash
+uv run python scripts/inspect_docs.py
+```
+
+按篇打印页数/字符数/编码，检查四类问题（阈值见 `scripts/rag_loader.py`）：空页率 > 20%（扫描版 PDF）、重复行率 > 30%（页眉页脚）、乱码率 > 0.1%（编码/字体）、平均每页 < 50 字符（抽不出文字）。
+
+### ② 切分
+
+```bash
+# 默认 chunk_size=500、overlap=100（≈20%）
+uv run python scripts/inspect_chunks.py
+
+# 自定义参数、每篇多看几个样本
+uv run python scripts/inspect_chunks.py --chunk-size 700 --overlap 120 --samples 3
+```
+
+切分规则：
+
+1. Markdown 先按 `#` / `##` / `###` 切（`MarkdownHeaderTextSplitter`），保住章节语义；
+2. 过长的章节再用 `RecursiveCharacterTextSplitter` 按中文标点递归切，相邻 chunk 保留 overlap，避免一句话被切断；
+3. 每个 chunk 的正文前拼上**章节路径**（如 `退换货政策 > 退货流程`），单独召回时模型也知道上下文；
+4. PDF 按页切，chunk 记录 `page_start`，回答时可标注页码。
+
+JSONL 每行一个 chunk：`{id, text, source, title, chunk_index, section, page_start, metadata}`。`chunks_report.json` 记录切分参数与长度分布——**参数一变，向量索引就必须重建**。
+
+### ③ 向量化与检索验证
+
+**为什么用 Docker 跑 Chroma**：本机 Chroma 的嵌入式 `PersistentClient` 打不开本地持久化库（Rust SQLite 后端报 `code: 14 unable to open database file`），而 `HttpClient` 连接 Chroma 服务正常。所以用官方镜像起一个常驻服务，数据落在 `.rag/chroma`（docker volume 挂载）。
+
+```bash
+# 1) 启动 Chroma 服务（只需一次；restart unless-stopped 会跟随 Docker 启动）
+docker compose up -d chroma
+docker ps                      # 应看到 skills-agent-chroma，127.0.0.1:8100->8000
+
+# 2) 构建索引（参数与 chunk hash 都没变会自动跳过，不花 embedding 费用）
+uv run python scripts/build_rag_index.py
+uv run python scripts/build_rag_index.py --force    # 强制重建
+
+# 3) 检索验证
+uv run python scripts/search_docs.py --query "退货要多久才能退款？"
+uv run python scripts/search_docs.py --query "token 有效期多久？" --top-k 3 --json
+```
+
+环境变量（`.env`，说明见 `.env.example`）：`ZHIPU_API_KEY`、`RAG_EMBEDDING_MODEL=embedding-3`、`RAG_EMBEDDING_DIMENSIONS=1024`、`RAG_CHROMA_HOST=127.0.0.1`、`RAG_CHROMA_PORT=8100`。
+
+**重建判定（`.rag/index_manifest.json`）**：manifest 记录 embedding 模型/维度、chunk_size/overlap、collection 名、每个 chunk 文件的 sha256 和 token 用量。任一不同、或 Chroma 里条数与 chunk 数不一致、或传 `--force` → 删旧 collection 全量重建；全部一致 → 直接跳过。
+
+**实测开销**：8 个 chunk、565 tokens、1 次请求、约 **0.00028 元**（embedding-3 按 0.5 元/百万 tokens）。示例文档下几乎可忽略；真实语料按 1 万 chunks × 200 tokens ≈ 200 万 tokens ≈ 1 元/次全量重建。
+
+**注意**：换 embedding 模型或维度必须重建（Chroma 的 collection 维度固定）；Chroma 服务是单写者，构建索引请在单机离线做，运行期只读检索。
+
 ## CLI 命令
 
 ```bash
@@ -349,6 +415,19 @@ skills-agent-proto/
 ├── docs/                 # 文档
 │   ├── skill_introduce.md
 │   └── langchain_agent_skill.md
+├── knowledge/            # RAG 原始资料（进 git，按业务域分目录）
+│   ├── api/
+│   └── product/
+├── scripts/              # RAG 离线脚本
+│   ├── rag_loader.py     # ① 加载 + 质检
+│   ├── inspect_docs.py   # ① 命令行入口
+│   ├── rag_splitter.py   # ② 切分
+│   ├── inspect_chunks.py # ② 命令行入口
+│   ├── rag_embeddings.py # ③ 智谱 embedding 适配器（httpx，64 条/批、429 退避）
+│   ├── build_rag_index.py# ③ 建索引 + manifest（跳过/重建判定）
+│   └── search_docs.py    # ③ 检索验证
+├── docker-compose.yml    # 本地 Chroma 服务（第③步，127.0.0.1:8100）
+├── .rag/                 # RAG 生成物（gitignore：抽取文本、chunk、向量索引）
 └── .claude/skills/       # 示例 Skills
     └── news-extractor/
         ├── SKILL.md
@@ -399,6 +478,21 @@ uv run python -m pytest tests/ -v
 | `SKILLS_SUMMARY_KEEP_MESSAGES` | 摘要后保留的最近消息条数 | `20` |
 | `MAX_TOKENS` | 最大输出 tokens | `16000` |
 | `MODEL_TEMPERATURE` | 模型温度 | `1.0` |
+| `RAG_DOCS_DIR` | RAG 原始资料目录 | `knowledge` |
+| `RAG_CHUNK_SIZE` | 每个 chunk 最大字符数 | `500` |
+| `RAG_CHUNK_OVERLAP` | 相邻 chunk 重叠字符数 | `100` |
+| `RAG_CHUNKS_DIR` | 切分产物目录 | `.rag/chunks` |
+| `RAG_INDEX_DIR` | 向量索引在宿主机上的位置（docker 挂载目录，仅说明用） | `.rag/chroma` |
+| `RAG_COLLECTION` | Chroma collection 名 | `knowledge` |
+| `RAG_CHROMA_HOST` | Chroma 服务地址（第③步） | `127.0.0.1` |
+| `RAG_CHROMA_PORT` | Chroma 服务端口 | `8100` |
+| `RAG_CHROMA_SSL` | Chroma 是否走 HTTPS | `false` |
+| `ZHIPU_API_KEY` | 智谱 API Key（第③步 embedding 使用） | 无 |
+| `RAG_EMBEDDING_MODEL` | 智谱 embedding 模型名 | `embedding-3` |
+| `RAG_EMBEDDING_DIMENSIONS` | 向量维度（`embedding-3` 可选 256/512/1024/2048） | `1024` |
+| `RAG_EMBEDDING_BATCH_SIZE` | 每批 embedding 条数（智谱上限 64） | `64` |
+| `RAG_EMBEDDING_TIMEOUT` | embedding 请求超时（秒） | `30` |
+| `RAG_EMBEDDING_MAX_RETRIES` | 429/5xx 重试次数 | `3` |
 
 > 建议优先使用 `MODEL_*` 通用变量；这样在 DeepSeek / Anthropic / OpenAI 之间切换时只需要改 provider、model、base_url。
 
