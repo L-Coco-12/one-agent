@@ -6,6 +6,7 @@ LangChain Tools 定义
 - bash: 执行命令/脚本（Level 3）
 - read_file: 读取文件
 - remember / recall: 长期记忆的写入与检索（跨会话，依赖 runtime.store）
+- search_docs: 检索本地 RAG 知识库（Chroma + 智谱 embedding，带 source/section）
 
 ToolRuntime 提供访问运行时信息的统一接口：
 - state: 可变的执行状态
@@ -13,9 +14,12 @@ ToolRuntime 提供访问运行时信息的统一接口：
 - store: 长期记忆库（跨 thread / 跨会话）
 """
 
+import importlib
+import os
 import subprocess
 import fnmatch
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -588,6 +592,97 @@ def recall(query: str, runtime: ToolRuntime[SkillAgentContext]) -> str:
     return "[OK] Long-term memories:\n" + "\n".join(lines)
 
 
+# --------------------------------------------------------------------- RAG 检索
+# 检索实现与 scripts/ 层共用，避免 embedding / Chroma 逻辑出现两份：
+# - scripts/rag_embeddings.py：智谱 embedding（批量、重试）
+# - scripts/search_docs.py：Chroma 连接、collection 打开、检索
+# 只有第一次真正调用 search_docs 时才连接服务（惰性加载，不拖慢 agent 启动）。
+_RAG_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
+DEFAULT_SEARCH_TOP_K = 4
+MAX_SEARCH_TOP_K = 10
+SEARCH_PREVIEW_CHARS = 500
+
+_rag_store = None
+
+
+def _get_rag_store():
+    """惰性创建「智谱 embedding + Chroma」检索栈。"""
+    global _rag_store
+    if _rag_store is not None:
+        return _rag_store
+
+    if str(_RAG_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_RAG_SCRIPTS_DIR))
+    search_module = importlib.import_module("search_docs")
+
+    host, port, use_ssl = search_module.chroma_settings()
+    client = search_module.create_chroma_client(host, port, use_ssl)
+    embeddings = search_module.ZhipuEmbeddings.from_env()
+    collection = os.getenv("RAG_COLLECTION") or search_module.DEFAULT_COLLECTION
+    _rag_store = search_module.open_vector_store(client, collection, embeddings)
+    return _rag_store
+
+
+@tool
+def search_docs(
+    query: str,
+    runtime: ToolRuntime[SkillAgentContext],
+    top_k: int = DEFAULT_SEARCH_TOP_K,
+) -> str:
+    """
+    Search the local RAG knowledge base (product FAQs, API docs, internal policies).
+
+    Use this tool before answering questions about documented facts, e.g.
+    refund/return policies, token expiry, error codes, product rules, or
+    anything that may live in the knowledge/ directory. Results include the
+    source file and section, so cite them in your final answer.
+
+    Prefer this over bash/read_file for knowledge/ documents, and if no
+    relevant documents are found, tell the user the knowledge base doesn't
+    cover it instead of guessing.
+
+    Args:
+        query: Natural-language question or keywords to search for.
+        top_k: How many chunks to return (1-10, default 4).
+    """
+    try:
+        store = _get_rag_store()
+    except Exception as exc:  # 连接失败 / 缺 Key / 服务未启动
+        return (
+            f"[FAILED] Knowledge base unavailable: {type(exc).__name__}: {exc}. "
+            "Start Chroma first (docker compose up -d chroma) and build the index "
+            "(uv run python scripts/build_rag_index.py), and make sure ZHIPU_API_KEY is set."
+        )
+
+    try:
+        clamped = max(1, min(int(top_k), MAX_SEARCH_TOP_K))
+        pairs = store.similarity_search_with_score(query, k=clamped)
+    except Exception as exc:
+        return f"[FAILED] Knowledge base search failed: {type(exc).__name__}: {exc}"
+
+    if not pairs:
+        return "[OK] No relevant documents found in the knowledge base."
+
+    lines = [f"[OK] Found {len(pairs)} relevant chunk(s) (higher score = more similar):"]
+    for index, (document, distance) in enumerate(pairs, 1):
+        metadata = getattr(document, "metadata", None) or {}
+        text = (getattr(document, "page_content", "") or "").strip()
+        if len(text) > SEARCH_PREVIEW_CHARS:
+            text = text[:SEARCH_PREVIEW_CHARS] + "…"
+        source = metadata.get("source") or "unknown"
+        section = metadata.get("section") or ""
+        page = metadata.get("page_start")
+        location = f"source={source}"
+        if section:
+            location += f" section={section}"
+        if page is not None:
+            location += f" page={page}"
+        lines.append(f"[{index}] score={1.0 - float(distance):.4f} {location}")
+        lines.append(f"    {text}")
+    lines.append("Cite the source (and section/page when available) in your answer.")
+    return "\n".join(lines)
+
+
 ALL_TOOLS = [
     load_skill,
     bash,
@@ -599,4 +694,5 @@ ALL_TOOLS = [
     list_dir,
     remember,
     recall,
+    search_docs,
 ]

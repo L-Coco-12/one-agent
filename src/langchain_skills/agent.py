@@ -534,6 +534,14 @@ Long-term memory:
 - Use the `recall` tool before answering questions about the user's
   preferences, past decisions, or ongoing work from earlier sessions.
 
+Knowledge base (RAG):
+- Use the `search_docs` tool before answering questions about documented
+  facts: refund/return policies, token expiry, error codes, product rules,
+  or anything that may live in the knowledge/ directory.
+- Cite the returned source (and section/page when available) in your answer.
+- If no relevant documents are found, say the knowledge base doesn't cover
+  it instead of guessing.
+
 When a user request matches a skill's description, use the load_skill tool to get detailed instructions before proceeding."""
 
         return self.skill_loader.build_system_prompt(base_prompt)

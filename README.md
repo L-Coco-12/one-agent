@@ -252,14 +252,15 @@ Web 页面上就是"新建会话"后再问——同一个后端进程内记忆�
 
 ## RAG 知识库（离线索引流水线）
 
-RAG 分三段：**① 加载与质检 → ② 切分 → ③ 向量化写入向量库**。当前已完成 ① ② ③：
+RAG 分四段：**① 加载与质检 → ② 切分 → ③ 向量化写入向量库 → ④ 接入 Agent**。当前已完成 ① ② ③ ④：
 
-| 步骤 | 脚本 | 输入 | 输出 |
+| 步骤 | 脚本 / 位置 | 输入 | 输出 |
 |---|---|---|---|
 | ① 加载质检 | `scripts/inspect_docs.py` | `knowledge/` 下的 md/txt/pdf | `.rag/extracted/` + `.rag/extraction_report.json` |
 | ② 切分 | `scripts/inspect_chunks.py` | 同上（直接读原文） | `.rag/chunks/*.jsonl` + `.rag/chunks_report.json` |
 | ③ 向量化 | `scripts/build_rag_index.py` | `.rag/chunks/` | Chroma（docker 服务 + `.rag/chroma` 数据目录）+ `.rag/index_manifest.json` |
 | ③ 检索验证 | `scripts/search_docs.py` | 一句话 | top-k chunk（带 source/section/score） |
+| ④ 接入 Agent | `src/langchain_skills/tools.py` 的 `search_docs` 工具 | 用户自然语言问题 | agent 自主检索，chunk 作为 ToolMessage 进入上下文 |
 
 **原始资料 vs 生成物**：`knowledge/` 进 git（Source of Truth）；`.rag/` 全部是生成物，已在 `.gitignore` 中，删掉可随时重建。
 
@@ -315,6 +316,40 @@ uv run python scripts/search_docs.py --query "token 有效期多久？" --top-k 
 **实测开销**：8 个 chunk、565 tokens、1 次请求、约 **0.00028 元**（embedding-3 按 0.5 元/百万 tokens）。示例文档下几乎可忽略；真实语料按 1 万 chunks × 200 tokens ≈ 200 万 tokens ≈ 1 元/次全量重建。
 
 **注意**：换 embedding 模型或维度必须重建（Chroma 的 collection 维度固定）；Chroma 服务是单写者，构建索引请在单机离线做，运行期只读检索。
+
+### ④ 接入 Agent（`search_docs` 工具）
+
+前三步是"离线建库"，这一步把检索接成 agent 的一个工具，形成 **Agentic RAG** 闭环：
+
+```
+用户提问 → 模型决定调 search_docs(query) → Chroma 检索 top-k
+        → chunk 作为 ToolMessage 回填 → 模型基于资料回答并标注 source
+```
+
+```bash
+# 不需要额外命令，agent 自带该工具
+uv run langchain-skills "退货后多久能退款？请引用来源"
+```
+
+行为要点：
+
+- **工具描述写"何时用"**：面向政策、退款、错误码、产品规则等文档型问题；模型会自己判断要不要查；
+- **返回带出处**：`source` / `section` / `page`，模型据此标注来源；检索为空时返回 `[OK] No relevant documents found...`，引导模型承认"知识库没覆盖"而不是编造；
+- **只读工具**：不在 `bash` / `write_file` 的 HITL 审批名单里，不会打断自动化；
+- **惰性连接**：首次调用才连 Chroma + 初始化智谱 embedding，不拖慢 agent 启动；服务没起时返回 `[FAILED] ... docker compose up -d chroma` 提示，而不是抛异常；
+- **上下文控制**：默认 top-k=4（上限 10），每个 chunk 截断 500 字符，避免一次塞爆上下文。
+
+实现上 `tools.py` 复用 `scripts/` 里同一套 embedding / Chroma 代码（`importlib` 按需加载），保证"脚本验证"和"agent 使用"走的是同一条检索链路，不会出现两份逻辑。
+
+实测（示例知识库）：
+
+```
+● search_docs(query=退货后多久能退款 退款到账时间)
+  └ [OK] Found 4 relevant chunk(s) ...
+    [1] score=0.8134 source=product/faq.md section=退换货政策常见问题 > 退货流程
+→ 回答中标注「来源：product/faq.md — 退换货政策 > 退货流程」，
+  并主动说明"其它支付渠道知识库未覆盖，建议咨询客服"
+```
 
 ## CLI 命令
 
@@ -395,7 +430,7 @@ skills-agent-proto/
 │   ├── agent.py          # LangChain Agent（provider 路由 + middleware 链 + HITL resume）
 │   ├── cli.py            # CLI 入口（流式输出 + 工具审批交互）
 │   ├── web_api.py        # FastAPI + SSE（含 /api/chat/resume）
-│   ├── tools.py          # 工具定义 (load_skill, bash, read/write_file, glob, grep, edit, list_dir, remember, recall)
+│   ├── tools.py          # 工具定义 (load_skill, bash, read/write_file, glob, grep, edit, list_dir, remember, recall, search_docs)
 │   ├── skill_loader.py   # Skills 发现和加载
 │   └── stream/           # 流式处理模块
 │       ├── emitter.py    # 事件发射器
