@@ -643,6 +643,21 @@ def test_classify_by_rules_recognizes_chat_and_task():
     assert _classify_by_rules("用 bash 运行 pytest") is True
     assert _classify_by_rules("LangChain 1.5 有什么新变化") is None
     assert _classify_by_rules("   ") is False
+    # 知识问句里的"提交/申请"、"列出"等词不应把题目误判成任务型
+    assert _classify_by_rules("退货要在哪里提交申请？") is False
+    assert _classify_by_rules("token 有效期多久？") is False
+    assert _classify_by_rules("提交退货申请后客服多久审核？") is False
+    # 明确"用某工具做事"仍应判任务型
+    assert _classify_by_rules("用 list_dir 工具列出当前目录的文件") is True
+
+
+def test_knowledge_gap_suffix_only_when_no_citation_and_no_admission():
+    suffix = LangChainSkillsAgent._knowledge_gap_suffix
+
+    assert suffix("退款一般在 1-3 个工作日内到账。").startswith("\n\n（注：")
+    assert suffix("详见 product/faq.md 的退货流程。") == ""
+    assert suffix("知识库未覆盖微信渠道的退款时效。") == ""
+    assert suffix("") == ""
 
 
 def test_agent_declares_agent_reply_response_format():

@@ -193,6 +193,10 @@ data: {"type": "interrupt", "interrupts": [{"id": "...", "value": {"action_reque
 同一句提问，可能是"帮我干活"，也可能只是"聊两句"。本项目用**规则快判 + 小模型分类**做意图路由：
 
 1. `_classify_by_rules()` 先用关键词判断（"帮我创建…"→任务型；"什么是…/解释一下…"→聊天型）；拿不准返回 `None`。
+   规则顺序是：**显式请求**（帮我/请你 + 动作）→ **指定工具**（"用 list_dir 工具…"）→ **知识/聊天疑问词**
+   （在哪里/多久/什么意思/如何/是否…）→ **动作动词**。像 `提交`、`列出`、`搜索`、`统计` 这类
+   既可能出现在"帮我做"、也可能出现在"在哪里提交"里的词，不再单独作为任务判据，交给小模型兜底，
+   避免把"退货要在哪里提交申请？"误判成任务型。
 2. 拿不准时调用分类模型 `_build_classifier_model()`（温度 0、关闭思考、`max_tokens=300`），
    用 `with_structured_output(Intent, method="function_calling")` 得到 `is_task` 与理由；失败则保守按聊天型处理。
    （必须指定 `function_calling`：DeepSeek 不支持 `json_schema` 形式的 `response_format`。）
@@ -204,11 +208,15 @@ data: {"type": "interrupt", "interrupts": [{"id": "...", "value": {"action_reque
 
 ```python
 {
-    "summary": "已创建 hello.txt 并写入 hi",
+    "summary": "退货入口在「我的订单 → 申请售后」，审核一般 1-3 个工作日。",
+    "sources": ["product/faq.md"],   # 回答依据的知识库来源，没有就留空
     "needs_followup": False,
     "followup_reason": None,
 }
 ```
+
+`summary` 放**直接给用户的答案**（不是"我做了什么"），`sources` 放引用来源——这两条同时写在
+字段描述里，模型能在工具 schema 里直接看到。
 
 事件流里会先出现一条 `{"type": "intent", "data": {"is_task": true, "source": "rule", "reason": "..."}}`，
 方便前端/日志观察判定结果（`source` 取值：`rule` / `llm` / `fallback` / `disabled`）。
@@ -341,6 +349,18 @@ uv run langchain-skills "退货后多久能退款？请引用来源"
 
 实现上 `tools.py` 复用 `scripts/` 里同一套 embedding / Chroma 代码（`importlib` 按需加载），保证"脚本验证"和"agent 使用"走的是同一条检索链路，不会出现两份逻辑。
 
+#### 知识库回答的三道护栏
+
+模型"查了资料却不好好引用"是 RAG 最常见的失败模式，这里用三层兜住：
+
+| 层 | 做法 | 解决什么 |
+|---|---|---|
+| 意图规则 | 知识问句（在哪里/多久/什么意思…）优先判聊天型，`提交`/`列出` 等歧义词不再单独作任务判据 | 避免知识问题被送进任务型通道、`AgentReply` 不带来源 |
+| 结构化契约 | `AgentReply` 增加 `sources` 字段，字段描述要求"summary 直接给答案、来源写进 sources" | 任务型轮次也强制带出处 |
+| 确定性兜底 | 聊天模式下，本轮用过 `search_docs` 但回答既没引用任何 `.md/.txt/.pdf` 来源、也没承认未覆盖时，代码追加固定提示"（注：以上回答未能引用知识库来源，知识库可能未覆盖该问题…）" | 不依赖模型自觉；评估时也可判定为"已承认未覆盖" |
+
+兜底只在本轮真的调用过 `search_docs` 时触发，普通闲聊不会莫名多出一句免责声明。
+
 实测（示例知识库）：
 
 ```
@@ -350,6 +370,85 @@ uv run langchain-skills "退货后多久能退款？请引用来源"
 → 回答中标注「来源：product/faq.md — 退换货政策 > 退货流程」，
   并主动说明"其它支付渠道知识库未覆盖，建议咨询客服"
 ```
+
+## RAG 评估（检索层）
+
+改了 chunk 参数、换 embedding、加混合检索之后，怎么知道"真的变好"？先建尺子：`evals/rag_questions.jsonl` 是 20 道人工标注题（16 单跳 + 2 多跳 + 2 无答案），每题记录期望的 `source` / `section`。
+
+```bash
+# 前置：Chroma 已启动、索引已构建、.env 有 ZHIPU_API_KEY
+uv run python scripts/eval_rag.py
+uv run python scripts/eval_rag.py --top-k 6 --json
+# 报告写到 evals/report.md（每次运行覆盖）
+```
+
+指标口径（只评检索，不调 LLM）：
+
+| 指标 | 含义 |
+|---|---|
+| Hit@1 / Hit@4 | 期望 section 是否出现在前 1 / 前 4 条（多跳题要求所有期望 section 都出现） |
+| MRR | 单跳题第一个命中排名的倒数均值（越接近 1 越好） |
+| Precision@k | 单跳题 top-k 里相关 chunk 的占比 |
+| 多跳全覆盖率 | 多跳题的所有期望 section 是否都进 top-k |
+| 无答案拒答率 | 知识库没覆盖的问题，top-1 相似度是否低于阈值（默认 0.45） |
+
+当前基线（8 chunk 示例语料，top_k=6）：**Hit@1 88.9%、Hit@4 100%、MRR 1.000、多跳全覆盖 100%、无答案拒答 0%**。
+
+两条重要结论：
+
+1. **检索已到这个小语料的天花板**——单跳题 top-1 全中，继续调 chunk_size 意义不大；要做有意义的对比，得先扩语料或换更难的题（口语化、错别字、跨文档推理）。
+2. **无答案题不能只看相似度阈值**——本语料里 OOD 问题 top-1 也在 0.61–0.65，和正常问题 0.63–0.80 重叠。区分"知识库没答案"要靠下一层：看 agent 回答是否承认未覆盖（见下一节生成层评估）。
+
+`tests/test_eval_rag.py` 用假检索覆盖了指标计算，不依赖 Chroma/智谱，可进 CI。
+
+## RAG 评估（生成层）
+
+检索层只回答"资料找没找到"，生成层回答"答得对不对"。`scripts/eval_answer.py` 端到端跑真实 agent（DeepSeek + search_docs + Chroma），按同样 20 道题给回答打分。
+
+```bash
+# 前置：Chroma 已启动、索引已构建、.env 有 MODEL_* 与 ZHIPU_API_KEY
+uv run python scripts/eval_answer.py                      # 跑一遍
+uv run python scripts/eval_answer.py --repeat 3           # 每题跑 3 次，测非确定性
+uv run python scripts/eval_answer.py --judge --limit 5    # 额外 LLM-as-judge（额外费用）
+# 报告写到 evals/answer_report.md（每次运行覆盖）
+```
+
+判分规则（规则式，确定可复现，不依赖 judge）：
+
+| 指标 | 含义 |
+|---|---|
+| 通过率 | 每次运行是否通过；通过 =「引用了期望来源 + 关键事实覆盖 + 无编造引用」（无答案题 =「明确承认未覆盖 + 无编造」） |
+| 严格通过率 | `--repeat > 1` 时，每一次都通过才算过（抗采样噪声） |
+| 波动题数 | 重复运行中一会儿过一会儿不过的题 |
+| 引用出现率 | 回答里是否至少出现一个引用 |
+| 期望来源命中率 | 可回答题是否引用了标注的 `expected_sources` |
+| 关键事实覆盖率 | `must_contain` 里的条目是否都出现；普通字符串忽略空白/Markdown 装饰，也可写正则（如 `退货入口.{0,6}关闭`）容忍模型改述（`must_contain_ok` 为 None 时不计入） |
+| 编造引用题数 | 回答引用了既不来自本轮检索、也不在 `knowledge/` 里的文件（幻觉引用） |
+| 无答案承认率 | 知识库未覆盖的题，是否明确说"未覆盖/不知道"而不是硬编 |
+| 检索命中率 | 本轮 search_docs 结果里是否包含期望 source+section（回答对不对的前提） |
+
+示例基线（8 chunk 语料、20 题 × 3 次）：**通过率 100%、严格通过率 100%、波动 0 题；引用出现 100%、期望来源 100%、关键事实覆盖 100%、检索命中 100%、编造引用 0；无答案承认率 100%**。完整数字见 `evals/answer_report.md`。
+
+这个 100% 是"三道护栏"修完后的结果，对比修复前同一套题：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 通过率 / 严格通过率 | 93.3% / 90.0% | 100% / 100% |
+| 波动题数 | 2（q03、q20） | 0 |
+| 引用出现率 | 96.7% | 100% |
+| 无答案承认率 | 66.7% | 100% |
+| 被误判成任务型的题数 | 6 | 0 |
+| 平均工具调用 | 5.03 | 4.57 |
+
+对应三处改动：
+
+1. **意图规则**：`提交/列出/搜索` 等歧义词不再单独判任务型；知识疑问词（在哪里/多久/什么意思…）优先按聊天处理；"用 xx 工具…"仍判任务型。q03/q04 不再走 `AgentReply`，引用就回来了。
+2. **`AgentReply.sources`**：结构化交付也必须带来源；`summary` 字段描述改为"直接给最终答复，不要描述你做了什么"。
+3. **确定性兜底**：本轮用过 `search_docs` 但回答既没引用来源、也没承认未覆盖时，代码追加固定提示；评估据此判为"已承认未覆盖"，q20 不再靠模型自觉。
+
+另外修了评估自身的两个标注问题：q06 的 `must_contain` 曾同时写 en dash 与连字符两种写法（按"全部满足"必失败）；q08/q09 的事实标注改成正则（模型会把"退货入口关闭"写成"退货入口就会关闭"、"平台承担"写成"平台来承担"）。**注意**：100% 只说明"这 20 题 × 8 chunk 小语料"已到天花板；要得到有区分度的数字，下一步是把语料扩到 30–60 篇、题集扩到 50 题（含更多无答案/多跳/口语改写），并把 `MODEL_TEMPERATURE` 固定为 0 再作为回归基线。
+
+`tests/test_eval_answer.py` 用假事件流覆盖了打分与报告逻辑，不依赖真实模型，可进 CI。
 
 ## CLI 命令
 
@@ -453,6 +552,10 @@ skills-agent-proto/
 ├── knowledge/            # RAG 原始资料（进 git，按业务域分目录）
 │   ├── api/
 │   └── product/
+├── evals/                # RAG 评估（阶段 A）
+│   ├── rag_questions.jsonl  # 20 道人工标注题（期望 source / section）
+│   ├── report.md            # eval_rag.py 每次运行生成的指标报告
+│   └── answer_report.md     # eval_answer.py 每次运行生成的生成层报告
 ├── scripts/              # RAG 离线脚本
 │   ├── rag_loader.py     # ① 加载 + 质检
 │   ├── inspect_docs.py   # ① 命令行入口
@@ -460,7 +563,9 @@ skills-agent-proto/
 │   ├── inspect_chunks.py # ② 命令行入口
 │   ├── rag_embeddings.py # ③ 智谱 embedding 适配器（httpx，64 条/批、429 退避）
 │   ├── build_rag_index.py# ③ 建索引 + manifest（跳过/重建判定）
-│   └── search_docs.py    # ③ 检索验证
+│   ├── search_docs.py    # ③ 检索验证
+│   ├── eval_rag.py       # 评估：Hit@k / MRR / Precision / 无答案拒答
+│   └── eval_answer.py    # 评估：引用真实性 / 关键事实 / 无答案承认 / 重复运行
 ├── docker-compose.yml    # 本地 Chroma 服务（第③步，127.0.0.1:8100）
 ├── .rag/                 # RAG 生成物（gitignore：抽取文本、chunk、向量索引）
 └── .claude/skills/       # 示例 Skills

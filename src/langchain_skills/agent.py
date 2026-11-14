@@ -99,7 +99,19 @@ class AgentReply(BaseModel):
     调用会被框架拦截（不会真的执行），结果写入 structured_response。
     """
 
-    summary: str = Field(description="用一两句话说明任务完成了什么")
+    summary: str = Field(
+        description=(
+            "直接给用户的最终答复（不要描述你做了什么）；"
+            "有知识库来源时，把来源写进 sources 字段"
+        )
+    )
+    sources: list[str] = Field(
+        default_factory=list,
+        description=(
+            "回答依据的知识库来源，如 product/faq.md（search_docs 返回的 source）；"
+            "没有引用任何来源就留空"
+        ),
+    )
     needs_followup: bool = Field(
         default=False, description="是否还需要用户补充信息或确认"
     )
@@ -126,18 +138,38 @@ INTENT_CLASSIFIER_PROMPT = (
 )
 
 # 关键词快判：命中则不必再调用小模型
+# 聊天/知识问句：疑问词优先，避免"提交/多久"这类词被误判成任务型
 _CHAT_PATTERN = re.compile(
     r"(什么是|是什么|为什么|怎么理解|怎么用|如何使用|解释一下|讲解一下|介绍一下|"
-    r"有什么区别|区别是什么|你好|您好|谢谢|再见|辛苦了)"
+    r"有什么区别|区别是什么|你好|您好|谢谢|再见|辛苦了|"
+    r"在哪里|哪里|在哪|多久|多长时间|多少|几天|几个|什么意思|什么含义|"
+    r"如何|是否|能不能|可不可以|会不会)"
 )
 # 明确的"请帮我做"句式优先判为任务型
 _EXPLICIT_TASK_PATTERN = re.compile(
     r"(帮我|请你|给我|麻烦你?).{0,20}(改|写|创建|新建|删除|运行|执行|安装|修复|生成|跑)"
 )
+# 明确指定使用某个工具（"用 list_dir 工具列出..."）也是任务型
+_TOOL_USE_PATTERN = re.compile(
+    r"(用|使用|调用|通过)\s*[\w\u4e00-\u9fff]+\s*(工具|tool)", re.IGNORECASE
+)
+# 真正的动作动词；"提交/读取/列出/查找/搜索/统计"这类容易出现在知识问句里的词
+# 不再单独作为任务判据，交给小模型兜底判断。
 _TASK_PATTERN = re.compile(
     r"(创建|新建|修改|删除|重命名|写入|保存|运行|执行|跑|安装|部署|下载|"
-    r"提交|修复|改一下|帮我改|生成文件|写个|写一个|读取|列出|查找|搜索|"
-    r"查一下|统计|检查|清理)"
+    r"修复|改一下|帮我改|生成文件|写个|写一个|检查|清理)"
+)
+
+# 知识库兜底：判断回答里是否引用了文档来源、是否已经承认"知识库未覆盖"
+_DOC_CITATION_PATTERN = re.compile(
+    r"[A-Za-z0-9_\-./]+\.(?:md|markdown|txt|pdf)", re.IGNORECASE
+)
+_KNOWLEDGE_GAP_PATTERN = re.compile(
+    r"(未覆盖|没有覆盖|未提及|没有提及|没有相关内容|没有找到相关|未找到相关|"
+    r"无法从知识库|无法回答|知识库中没有|知识库没有|知识库未|无法确定|不清楚|不知道)"
+)
+_KNOWLEDGE_GAP_SUFFIX = (
+    "\n\n（注：以上回答未能引用知识库来源，知识库可能未覆盖该问题，请以官方渠道为准。）"
 )
 
 
@@ -152,6 +184,8 @@ def _classify_by_rules(text: str) -> Optional[bool]:
     if not normalized:
         return False
     if _EXPLICIT_TASK_PATTERN.search(normalized):
+        return True
+    if _TOOL_USE_PATTERN.search(normalized):
         return True
     if _CHAT_PATTERN.search(normalized):
         return False
@@ -538,9 +572,14 @@ Knowledge base (RAG):
 - Use the `search_docs` tool before answering questions about documented
   facts: refund/return policies, token expiry, error codes, product rules,
   or anything that may live in the knowledge/ directory.
+- Knowledge questions ("where do I submit...", "how long does it take...",
+  "what does error 40102 mean") should be answered from `search_docs`
+  results, not by describing actions you would take.
 - Cite the returned source (and section/page when available) in your answer.
+  When you deliver a structured `AgentReply`, put the real answer in
+  `summary` and list the sources in its `sources` field.
 - If no relevant documents are found, say the knowledge base doesn't cover
-  it instead of guessing.
+  it instead of guessing; never invent a policy, date, or error code.
 
 When a user request matches a skill's description, use the load_skill tool to get detailed instructions before proceeding."""
 
@@ -1028,6 +1067,7 @@ When a user request matches a skill's description, use the load_skill tool to ge
         full_response = ""
         reasoning_tokens = 0
         thinking_seen = False
+        used_search = False
         debug = os.getenv("SKILLS_DEBUG", "").lower() in ("1", "true", "yes")
 
         # 使用 messages 模式获取 token 级流式
@@ -1076,6 +1116,8 @@ When a user request matches a skill's description, use the load_skill tool to ge
 
                 # 处理 ToolMessage (工具执行结果)
                 elif hasattr(chunk, "type") and chunk.type == "tool":
+                    if str(getattr(chunk, "name", "") or "") == "search_docs":
+                        used_search = True
                     if debug:
                         tool_name = getattr(chunk, "name", "unknown")
                         print(f"[DEBUG] Processing tool result: {tool_name}")
@@ -1108,6 +1150,14 @@ When a user request matches a skill's description, use the load_skill tool to ge
                 "This endpoint does not expose reasoning summary text in the stream.]"
             ).data
 
+        # 聊天模式兜底：检索过知识库，但回答既没引用来源、也没承认未覆盖时，
+        # 追加一句确定性提示（不依赖模型自觉），避免用户把猜测当有出处的答案。
+        if used_search and not active_context.task_mode:
+            suffix = self._knowledge_gap_suffix(full_response)
+            if suffix:
+                full_response += suffix
+                yield emitter.text(suffix).data
+
         # 流结束：若停在人工审批点，先发 interrupt（不发 done），否则发 done
         snapshot = self._read_state_snapshot(config)
         pending = self._interrupts_from_snapshot(snapshot)
@@ -1118,6 +1168,21 @@ When a user request matches a skill's description, use the load_skill tool to ge
             full_response,
             structured=self._read_structured_response(config, snapshot=snapshot),
         ).data
+
+    @staticmethod
+    def _knowledge_gap_suffix(text: str) -> str:
+        """聊天模式下判断是否要给回答补一句"知识库可能未覆盖"的提示
+
+        Returns:
+            需要提示时返回可追加的文本，否则返回空字符串。
+        """
+        if not text.strip():
+            return ""
+        if _DOC_CITATION_PATTERN.search(text):
+            return ""
+        if _KNOWLEDGE_GAP_PATTERN.search(text):
+            return ""
+        return _KNOWLEDGE_GAP_SUFFIX
 
     def _read_state_snapshot(self, config: dict):
         """读取图状态快照（失败返回 None）"""
