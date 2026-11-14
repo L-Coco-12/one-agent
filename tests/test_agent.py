@@ -17,13 +17,20 @@ from langchain.agents.middleware import (
     ToolRetryMiddleware,
 )
 from langchain.agents.middleware.types import ModelRequest
+from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.types import Command
 
 from langchain_skills.agent import (
+    UNVERIFIED_CITATION,
     AgentReply,
     Intent,
     LangChainSkillsAgent,
+    _LOW_RELEVANCE_SUFFIX,
     _classify_by_rules,
+    _extract_search_scores,
+    _extract_search_sources,
+    _sanitize_citations,
+    _sanitize_structured_reply,
     resolve_model_config,
 )
 from langchain_skills.tools import ALL_TOOLS, _recall_facts, _remember_fact
@@ -660,6 +667,72 @@ def test_knowledge_gap_suffix_only_when_no_citation_and_no_admission():
     assert suffix("") == ""
 
 
+def test_extract_search_scores_from_tool_output():
+    content = (
+        "[OK] Found 2 relevant chunk(s) (higher score = more similar):\n"
+        "[1] score=0.6903 source=product/faq.md section=退货流程\n"
+        "[2] score=0.3120 source=api/auth.md section=令牌有效期\n"
+    )
+
+    assert _extract_search_scores(content) == [0.6903, 0.312]
+    assert _extract_search_scores("no scores here") == []
+
+
+def test_low_relevance_suffix_only_when_no_admission():
+    suffix = LangChainSkillsAgent._low_relevance_suffix
+
+    assert suffix("根据 fastapi/tutorial-cors.md，预检请求会先发 OPTIONS。").startswith("\n\n（注：")
+    assert suffix("知识库未覆盖 Redis 缓存的过期策略。") == ""
+    assert suffix("") == ""
+
+
+def test_low_relevance_threshold_reads_env():
+    with _patched_env({"RAG_LOW_RELEVANCE_SCORE": "0.72"}):
+        assert LangChainSkillsAgent._low_relevance_threshold() == 0.72
+    with _patched_env({"RAG_LOW_RELEVANCE_SCORE": "not-a-number"}):
+        assert LangChainSkillsAgent._low_relevance_threshold() == 0.5
+    with _patched_env({}):
+        assert LangChainSkillsAgent._low_relevance_threshold() == 0.5
+
+
+class _LowScoreGraph:
+    """模拟一次低分检索 + 带引用回答的流式图"""
+
+    def __init__(self):
+        self.interrupts: list[object] = []
+
+    def get_state(self, config):
+        return SimpleNamespace(interrupts=[])
+
+    def stream(self, input_payload, config=None, context=None, stream_mode=None):
+        yield ToolMessage(
+            content=(
+                "[OK] Found 1 relevant chunk(s) (higher score = more similar):\n"
+                "[1] score=0.31 source=kubernetes/concepts-overview.md section=组件\n"
+            ),
+            tool_call_id="call-1",
+            name="search_docs",
+        )
+        yield AIMessageChunk(
+            content="根据 kubernetes/concepts-overview.md 的内容，离职补偿按 N+1 计算。"
+        )
+
+
+def test_stream_events_appends_low_relevance_suffix_when_scores_are_low():
+    agent, *_ = _instantiate_agent(dict(_DEEPSEEK_ENV))
+    agent.agent = _LowScoreGraph()
+
+    events = list(agent.stream_events("离职补偿是什么意思？", thread_id="low-score"))
+
+    assert events[0]["type"] == "intent"
+    assert events[-1]["type"] == "done"
+    assert events[-1]["response"].endswith(_LOW_RELEVANCE_SUFFIX)
+    assert any(
+        event["type"] == "text" and event["content"] == _LOW_RELEVANCE_SUFFIX
+        for event in events
+    )
+
+
 def test_agent_declares_agent_reply_response_format():
     _, _, create_agent, _ = _instantiate_agent(dict(_DEEPSEEK_ENV))
 
@@ -809,3 +882,115 @@ def test_agent_attaches_store_and_memory_user():
     assert isinstance(agent.store, InMemoryStore)
     assert agent.context.user_id == "alice"
     assert create_agent.call_args.kwargs["store"] is agent.store
+
+
+# ---------------------------------------------------------------------------
+# 引用硬校验（编造的路径不能原样发给用户）
+# ---------------------------------------------------------------------------
+
+
+def test_extract_search_sources_from_tool_output():
+    text = (
+        "[OK] Found 2 relevant chunk(s) (higher score = more similar):\n"
+        "[1] score=0.78 source=product/faq.md section=退货流程 page=2\n"
+        "[2] score=0.69 source=api/auth.md section=令牌有效期\n"
+    )
+
+    assert _extract_search_sources(text) == ["product/faq.md", "api/auth.md"]
+
+
+def test_sanitize_citations_replaces_unknown_paths():
+    allowed = {"product/faq.md"}
+    text = "依据 product/faq.md，退货期限是 7 天；另见 advanced/settings.md。"
+
+    sanitized, invalid = _sanitize_citations(text, allowed)
+
+    assert "product/faq.md" in sanitized
+    assert "advanced/settings.md" not in sanitized
+    assert UNVERIFIED_CITATION in sanitized
+    assert invalid == ["advanced/settings.md"]
+
+
+def test_sanitize_citations_accepts_basename_and_repo_files():
+    allowed = {"product/faq.md"}
+    text = "见 faq.md 与 README.md。"
+
+    sanitized, invalid = _sanitize_citations(text, allowed)
+
+    assert sanitized == text
+    assert invalid == []
+
+
+def test_sanitize_structured_reply_strips_invalid_citations():
+    allowed = {"product/faq.md"}
+    structured = {
+        "summary": "已退货，依据 advanced/settings.md。",
+        "needs_followup": False,
+        "followup_reason": "",
+        "sources": ["product/faq.md", "advanced/settings.md"],
+    }
+
+    sanitized = _sanitize_structured_reply(structured, allowed)
+
+    assert sanitized["summary"] == f"已退货，依据 {UNVERIFIED_CITATION}。"
+    assert sanitized["sources"] == ["product/faq.md"]
+
+
+class _CitationGraph:
+    """模拟一次检索 + 回答里混入编造路径的流式图"""
+
+    def __init__(self):
+        self.interrupts: list[object] = []
+
+    def get_state(self, config):
+        return SimpleNamespace(interrupts=[])
+
+    def stream(self, input_payload, config=None, context=None, stream_mode=None):
+        yield ToolMessage(
+            content=(
+                "[OK] Found 1 relevant chunk(s) (higher score = more similar):\n"
+                "[1] score=0.72 source=product/faq.md section=退货流程\n"
+            ),
+            tool_call_id="call-1",
+            name="search_docs",
+        )
+        yield AIMessageChunk(
+            content="根据 product/faq.md，退货需 7 天；另可参考 advanced/settings.md。"
+        )
+
+
+def test_stream_events_replaces_fabricated_citations():
+    agent, *_ = _instantiate_agent(dict(_DEEPSEEK_ENV))
+    agent.agent = _CitationGraph()
+
+    events = list(agent.stream_events("退货要多久才能退款？", thread_id="citation"))
+
+    text = "".join(event["content"] for event in events if event["type"] == "text")
+    assert "advanced/settings.md" not in text
+    assert UNVERIFIED_CITATION in text
+    assert events[-1]["type"] == "done"
+    assert "advanced/settings.md" not in events[-1]["response"]
+
+
+class _NoSearchCitationGraph:
+    """模型完全跳过检索、凭记忆编路径"""
+
+    def __init__(self):
+        self.interrupts: list[object] = []
+
+    def get_state(self, config):
+        return SimpleNamespace(interrupts=[])
+
+    def stream(self, input_payload, config=None, context=None, stream_mode=None):
+        yield AIMessageChunk(content="参考 ghost/never.md，这个配置项默认是开启的。")
+
+
+def test_stream_events_replaces_fabricated_citations_without_search():
+    agent, *_ = _instantiate_agent(dict(_DEEPSEEK_ENV))
+    agent.agent = _NoSearchCitationGraph()
+
+    events = list(agent.stream_events("你好", thread_id="no-search"))
+
+    text = "".join(event["content"] for event in events if event["type"] == "text")
+    assert "ghost/never.md" not in text
+    assert UNVERIFIED_CITATION in text

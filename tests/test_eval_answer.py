@@ -365,3 +365,54 @@ def test_knowledge_sources_scans_dir(tmp_path: Path) -> None:
     (tmp_path / "api" / "auth.md").write_text("x", encoding="utf-8")
     (tmp_path / "ignore.png").write_bytes(b"x")
     assert evaluator.knowledge_sources(tmp_path) == {"api/auth.md"}
+
+
+def test_normalize_cited_source_strips_section_path() -> None:
+    assert (
+        evaluator.normalize_cited_source(
+            "fastapi/tutorial-cors.md > CORS（跨域资源共享） > 使用 CORSMiddleware"
+        )
+        == "fastapi/tutorial-cors.md"
+    )
+    assert (
+        evaluator.normalize_cited_source("product/faq.md — 退换货政策 > 退货流程")
+        == "product/faq.md"
+    )
+    assert evaluator.normalize_cited_source("product/faq.md") == "product/faq.md"
+
+
+def test_section_suffixed_structured_sources_resolve_to_real_files() -> None:
+    known = {"fastapi/tutorial-cors.md", "fastapi/tutorial-middleware.md"}
+    events = [
+        {"type": "tool_call", "name": "search_docs", "args": {"query": "q"}, "id": "c1"},
+        _search_result_event(
+            "[1] score=0.70 source=fastapi/tutorial-cors.md section=CORS 预检请求",
+            "[2] score=0.60 source=fastapi/tutorial-middleware.md section=多个中间件的执行顺序",
+        ),
+        {"type": "tool_call", "name": "AgentReply", "args": {}, "id": "c2"},
+        {
+            "type": "done",
+            "response": "",
+            "structured": {
+                "summary": "CORS 预检先经过 CORS 中间件，再进入其它中间件。",
+                "sources": [
+                    "fastapi/tutorial-cors.md > CORS（跨域资源共享） > CORS 预检请求",
+                    "fastapi/tutorial-middleware.md > 中间件 > 多个中间件的执行顺序",
+                ],
+            },
+        },
+    ]
+    question = {
+        "id": "q40",
+        "type": "multi_hop",
+        "expected_sources": ["fastapi/tutorial-cors.md", "fastapi/tutorial-middleware.md"],
+        "expected_sections": ["CORS 预检请求", "多个中间件的执行顺序"],
+        "require_all_sections": True,
+        "must_contain": [],
+    }
+
+    result = evaluator.evaluate_question(question, events, known_sources=known)
+
+    assert result["fabricated_sources"] == []
+    assert result["expected_source_cited"] is True
+    assert result["passed"] is True

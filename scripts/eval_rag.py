@@ -260,8 +260,12 @@ def render_console(result: dict[str, Any]) -> str:
     if failures:
         lines.append("     失败题：")
         for row in failures:
-            expected = " | ".join(row.get("covered_sections") or [])
-            expected = expected or "（无答案题）"
+            if row["type"] == "no_answer":
+                expected = "（知识库未覆盖）"
+            else:
+                expected = " | ".join(row.get("missing_sections") or [])
+                expected = expected or " | ".join(row.get("covered_sections") or [])
+                expected = expected or "-"
             lines.append(
                 f"       - {row['id']} [{row['type']}] top1={_format_location(row['top1'])}"
                 f" score={float((row['top1'] or {}).get('score', 0.0)):.3f} 期望={expected}"

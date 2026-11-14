@@ -172,6 +172,142 @@ _KNOWLEDGE_GAP_SUFFIX = (
     "\n\n（注：以上回答未能引用知识库来源，知识库可能未覆盖该问题，请以官方渠道为准。）"
 )
 
+# 低相关度兜底：检索回来的都是"相似但不相关"的段落时，也要提醒用户
+DEFAULT_LOW_RELEVANCE_SCORE = 0.5
+_LOW_RELEVANCE_SUFFIX = (
+    "\n\n（注：知识库检索结果与问题相关度较低，可能未覆盖该问题，请以官方渠道为准。）"
+)
+_SEARCH_SCORE_PATTERN = re.compile(r"score=([0-9]*\.?[0-9]+)")
+
+
+def _extract_search_scores(text: str) -> list[float]:
+    """从 search_docs 的工具输出里解析相似度分数（形如 ``score=0.6903``）"""
+    scores: list[float] = []
+    for match in _SEARCH_SCORE_PATTERN.finditer(text):
+        try:
+            scores.append(float(match.group(1)))
+        except ValueError:
+            continue
+    return scores
+
+
+# 引用硬校验：回答里的每条 .md/.markdown/.txt/.pdf 路径，都必须能落到
+# "本轮 search_docs 的结果"或"knowledge/ 里真实存在的文档"，否则替换成提示。
+_SEARCH_SOURCE_PATTERN = re.compile(r"source=([^\s]+)")
+UNVERIFIED_CITATION = "（来源无法核实）"
+_KNOWLEDGE_SOURCES_CACHE: dict[str, tuple[float, set[str]]] = {}
+
+
+def _repo_root() -> Path:
+    """仓库根目录（src/langchain_skills/agent.py 往上三级）"""
+    return Path(__file__).resolve().parents[2]
+
+
+def _knowledge_dir() -> Path:
+    """知识库原始资料目录（可用 RAG_DOCS_DIR 覆盖，相对路径按仓库根解析）"""
+    raw = os.getenv("RAG_DOCS_DIR", "").strip()
+    if not raw:
+        return _repo_root() / "knowledge"
+    path = Path(raw)
+    return path if path.is_absolute() else _repo_root() / path
+
+
+def _knowledge_sources() -> set[str]:
+    """扫描 knowledge/ 下的文档，返回 posix 相对路径集合（按 mtime 缓存）"""
+    directory = _knowledge_dir()
+    key = str(directory)
+    try:
+        mtime = max(
+            (path.stat().st_mtime for path in directory.rglob("*") if path.is_file()),
+            default=0.0,
+        )
+    except OSError:
+        mtime = 0.0
+    cached = _KNOWLEDGE_SOURCES_CACHE.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    sources: set[str] = set()
+    if directory.is_dir():
+        for path in directory.rglob("*"):
+            if path.is_file() and path.suffix.lower() in {".md", ".markdown", ".txt", ".pdf"}:
+                sources.add(path.relative_to(directory).as_posix())
+    _KNOWLEDGE_SOURCES_CACHE[key] = (mtime, sources)
+    return sources
+
+
+def _extract_search_sources(text: str) -> list[str]:
+    """从 search_docs 的工具输出里解析 ``source=...`` 路径"""
+    return [match.group(1).strip() for match in _SEARCH_SOURCE_PATTERN.finditer(text)]
+
+
+def _resolve_citation_token(token: str, allowed: set[str]) -> bool:
+    """判断一个引用路径能否核实（完整路径 / basename / 仓库内真实文件）"""
+    clean = token.strip().strip("。，,.;；:：()（）[]【】<>'\"“”").lstrip("./")
+    if not clean:
+        return False
+    if clean in allowed:
+        return True
+    basename = clean.rsplit("/", 1)[-1]
+    if any(item.rsplit("/", 1)[-1] == basename for item in allowed):
+        return True
+    # 放行仓库内真实存在的文件（如 README.md），它们不算编造
+    try:
+        return (_repo_root() / clean).is_file()
+    except OSError:
+        return False
+
+
+def _sanitize_citations(text: str, allowed: set[str]) -> tuple[str, list[str]]:
+    """把无法核实的引用替换成"（来源无法核实）"
+
+    Returns:
+        (清洗后的文本, 被判定为无法核实的原始引用列表)
+    """
+    invalid: list[str] = []
+
+    def _replace(match: re.Match) -> str:
+        token = match.group(0)
+        if _resolve_citation_token(token, allowed):
+            return token
+        if token not in invalid:
+            invalid.append(token)
+        return UNVERIFIED_CITATION
+
+    return _DOC_CITATION_PATTERN.sub(_replace, text), invalid
+
+
+# 流式输出时，结尾的路径样式字符可能是被 chunk 切断的引用（如 "…autoscal" + ".md"），
+# 先扣住这一小段，等下一个非路径字符到达或流结束再做校验，避免半截路径漏网。
+_MAX_HELD_TEXT_CHARS = 300
+
+
+def _split_safe_text(buffer: str) -> tuple[str, str]:
+    """把文本切成"可安全发送的前缀" + "需要继续观察的尾部" """
+    match = re.search(r"[A-Za-z0-9_\-./]+$", buffer)
+    if match is None:
+        return buffer, ""
+    if len(match.group(0)) > _MAX_HELD_TEXT_CHARS:
+        return buffer, ""
+    return buffer[: match.start()], buffer[match.start() :]
+
+
+def _sanitize_structured_reply(structured: dict, allowed: set[str]) -> dict:
+    """清洗结构化交付：正文里的无效引用替换、sources 只保留可核实的"""
+    sanitized = dict(structured)
+    for key in ("summary", "followup_reason"):
+        value = sanitized.get(key)
+        if isinstance(value, str):
+            sanitized[key], _ = _sanitize_citations(value, allowed)
+    sources = sanitized.get("sources")
+    if isinstance(sources, list):
+        sanitized["sources"] = [
+            str(item).strip()
+            for item in sources
+            if str(item).strip() and _resolve_citation_token(str(item), allowed)
+        ]
+    return sanitized
+
 
 def _classify_by_rules(text: str) -> Optional[bool]:
     """
@@ -571,15 +707,21 @@ Long-term memory:
 Knowledge base (RAG):
 - Use the `search_docs` tool before answering questions about documented
   facts: refund/return policies, token expiry, error codes, product rules,
-  or anything that may live in the knowledge/ directory.
+  framework/API usage (e.g. FastAPI, Kubernetes), or anything that may live
+  in the knowledge/ directory. Do this even when you believe you already
+  know the answer: the knowledge base is the source of truth, and your own
+  memory cannot be audited by the user.
 - Knowledge questions ("where do I submit...", "how long does it take...",
   "what does error 40102 mean") should be answered from `search_docs`
   results, not by describing actions you would take.
 - Cite the returned source (and section/page when available) in your answer.
   When you deliver a structured `AgentReply`, put the real answer in
-  `summary` and list the sources in its `sources` field.
-- If no relevant documents are found, say the knowledge base doesn't cover
-  it instead of guessing; never invent a policy, date, or error code.
+  `summary` and list sources in its `sources` field as file paths exactly as
+  returned (e.g. `product/faq.md`), never section text.
+- If the retrieved chunks are unrelated or do not actually answer the
+  question (even though some documents came back), say the knowledge base
+  doesn't cover it; never pad an answer with unrelated chunks.
+- Never invent a policy, date, error code, or file name.
 
 When a user request matches a skill's description, use the load_skill tool to get detailed instructions before proceeding."""
 
@@ -1065,9 +1207,12 @@ When a user request matches a skill's description, use the load_skill tool to ge
         tracker = ToolCallTracker()
 
         full_response = ""
+        text_buffer = ""
         reasoning_tokens = 0
         thinking_seen = False
         used_search = False
+        best_search_score: Optional[float] = None
+        retrieved_sources: set[str] = set()
         debug = os.getenv("SKILLS_DEBUG", "").lower() in ("1", "true", "yes")
 
         # 使用 messages 模式获取 token 级流式
@@ -1102,7 +1247,21 @@ When a user request matches a skill's description, use the load_skill tool to ge
                         if ev.type == "thinking":
                             thinking_seen = True
                         if ev.type == "text":
-                            full_response += ev.data.get("content", "")
+                            # 引用校验：先扣住结尾可能被切成两半的路径，等它
+                            # 结束后整段清洗，避免 "…autoscal" + ".md" 拼回
+                            # 一个假引用（token 已发出就无法回改）。
+                            text_buffer += str(ev.data.get("content") or "")
+                            emit_part, text_buffer = _split_safe_text(text_buffer)
+                            if not emit_part:
+                                continue
+                            emit_part, _ = _sanitize_citations(
+                                emit_part, _knowledge_sources() | retrieved_sources
+                            )
+                            full_response += emit_part
+                            if debug:
+                                print("[DEBUG] Yielding: text")
+                            yield emitter.text(emit_part).data
+                            continue
                         if debug:
                             print(f"[DEBUG] Yielding: {ev.type}")
                         yield ev.data
@@ -1118,6 +1277,13 @@ When a user request matches a skill's description, use the load_skill tool to ge
                 elif hasattr(chunk, "type") and chunk.type == "tool":
                     if str(getattr(chunk, "name", "") or "") == "search_docs":
                         used_search = True
+                        tool_output = str(getattr(chunk, "content", "") or "")
+                        # 记录本轮检索到的来源，作为引用校验的白名单
+                        retrieved_sources.update(_extract_search_sources(tool_output))
+                        # 记录本轮检索的最高相似度，供低相关度兜底使用
+                        for score in _extract_search_scores(tool_output):
+                            if best_search_score is None or score > best_search_score:
+                                best_search_score = score
                     if debug:
                         tool_name = getattr(chunk, "name", "unknown")
                         print(f"[DEBUG] Processing tool result: {tool_name}")
@@ -1138,6 +1304,16 @@ When a user request matches a skill's description, use the load_skill tool to ge
             yield emitter.error(str(e)).data
             raise
 
+        # 流结束：把最后扣住的尾巴发出去（同样先做引用校验）
+        if text_buffer:
+            flushed, _ = _sanitize_citations(
+                text_buffer, _knowledge_sources() | retrieved_sources
+            )
+            text_buffer = ""
+            if flushed:
+                full_response += flushed
+                yield emitter.text(flushed).data
+
         if (
             self.enable_thinking
             and reasoning_tokens > 0
@@ -1154,6 +1330,12 @@ When a user request matches a skill's description, use the load_skill tool to ge
         # 追加一句确定性提示（不依赖模型自觉），避免用户把猜测当有出处的答案。
         if used_search and not active_context.task_mode:
             suffix = self._knowledge_gap_suffix(full_response)
+            if not suffix and (
+                best_search_score is not None
+                and best_search_score < self._low_relevance_threshold()
+            ):
+                # 检索到的片段分数都偏低：即使引用了，也要提示"可能未覆盖"
+                suffix = self._low_relevance_suffix(full_response)
             if suffix:
                 full_response += suffix
                 yield emitter.text(suffix).data
@@ -1164,10 +1346,13 @@ When a user request matches a skill's description, use the load_skill tool to ge
         if pending:
             yield emitter.interrupt(pending).data
             return
-        yield emitter.done(
-            full_response,
-            structured=self._read_structured_response(config, snapshot=snapshot),
-        ).data
+        structured = self._read_structured_response(config, snapshot=snapshot)
+        if isinstance(structured, dict):
+            # 结构化交付发生在流结束后，可以回改：正文替换无效引用、sources 过滤
+            structured = _sanitize_structured_reply(
+                structured, _knowledge_sources() | retrieved_sources
+            )
+        yield emitter.done(full_response, structured=structured).data
 
     @staticmethod
     def _knowledge_gap_suffix(text: str) -> str:
@@ -1183,6 +1368,30 @@ When a user request matches a skill's description, use the load_skill tool to ge
         if _KNOWLEDGE_GAP_PATTERN.search(text):
             return ""
         return _KNOWLEDGE_GAP_SUFFIX
+
+    @staticmethod
+    def _low_relevance_suffix(text: str) -> str:
+        """检索分数偏低时，判断是否要补"相关度较低、可能未覆盖"的提示
+
+        与 ``_knowledge_gap_suffix`` 的区别：这里不要求"没有引用"，
+        因为模型可能引用了一条相似度很低的无关文档。
+        """
+        if not text.strip():
+            return ""
+        if _KNOWLEDGE_GAP_PATTERN.search(text):
+            return ""
+        return _LOW_RELEVANCE_SUFFIX
+
+    @staticmethod
+    def _low_relevance_threshold() -> float:
+        """低相关度阈值（env ``RAG_LOW_RELEVANCE_SCORE`` 可覆盖）"""
+        raw = os.getenv("RAG_LOW_RELEVANCE_SCORE", "").strip()
+        if not raw:
+            return DEFAULT_LOW_RELEVANCE_SCORE
+        try:
+            return float(raw)
+        except ValueError:
+            return DEFAULT_LOW_RELEVANCE_SCORE
 
     def _read_state_snapshot(self, config: dict):
         """读取图状态快照（失败返回 None）"""

@@ -138,9 +138,32 @@ def parse_search_results(tool_results: list[dict[str, Any]]) -> list[dict[str, A
     return parsed
 
 
+CITATION_SUFFIX_PATTERN = re.compile(
+    r"^(.*?\.(?:md|markdown|txt|pdf))(?=$|[\s>—\-:：,，;；|])", re.IGNORECASE
+)
+
+
+def normalize_cited_source(cited: str) -> str:
+    """把"文件路径 + 章节路径"归一成文件路径。
+
+    模型常见的引用写法有两种：
+    - ``product/faq.md``
+    - ``fastapi/tutorial-cors.md > CORS（跨域资源共享） > 使用 CORSMiddleware``
+    - ``product/faq.md — 退换货政策 > 退货流程``
+
+    后两种引用是合法的，只是带了章节信息；比对前要截到文件后缀，
+    否则会被误判为"编造引用"。
+    """
+    text = str(cited or "").strip()
+    match = CITATION_SUFFIX_PATTERN.match(text)
+    if match:
+        text = match.group(1)
+    return text.strip().strip("。，,.;；:：()（）[]【】<>'\"“”")
+
+
 def resolve_citation(cited: str, known_sources: set[str]) -> str | None:
     """把回答里的引用对回知识库路径（都允许只写文件名）。"""
-    cited_clean = cited.strip().lstrip("./")
+    cited_clean = normalize_cited_source(cited).lstrip("./")
     if cited_clean in known_sources:
         return cited_clean
     basename = cited_clean.rsplit("/", 1)[-1]
