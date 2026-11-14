@@ -72,15 +72,29 @@ def test_parse_search_results_reads_score_section_and_page() -> None:
     )
     parsed = evaluator.parse_search_results([event])
     assert len(parsed) == 2
-    assert parsed[0] == {
-        "index": 1,
-        "score": 0.6903,
-        "source": "product/faq.md",
-        "section": "退换货政策常见问题 > 退货流程",
-        "page": 2,
-    }
+    assert parsed[0]["index"] == 1
+    assert parsed[0]["score"] == 0.6903
+    assert parsed[0]["source"] == "product/faq.md"
+    assert parsed[0]["section"] == "退换货政策常见问题 > 退货流程"
+    assert parsed[0]["page"] == 2
     assert parsed[1]["section"] == "API 鉴权说明 > 令牌有效期"
     assert parsed[1]["page"] is None
+
+
+def test_parse_search_results_keeps_chunk_content_for_judge() -> None:
+    event = _search_result_event(
+        "[1] score=0.6903 source=product/faq.md section=退货流程 page=2",
+        "签收后 7 天内可申请退货，质量问题由平台承担运费。",
+        "",
+        "[2] score=0.4120 source=api/auth.md section=令牌有效期",
+        "access_token 有效期 2 小时，refresh_token 有效期 30 天。",
+        "Cite the source (and section/page when available) in your answer.",
+    )
+    parsed = evaluator.parse_search_results([event])
+    assert len(parsed) == 2
+    assert "7 天内可申请退货" in parsed[0]["content"]
+    assert "refresh_token 有效期 30 天" in parsed[1]["content"]
+    assert "Cite the source" not in parsed[1]["content"]
 
 
 def test_parse_search_results_ignores_other_tools_and_failures() -> None:
@@ -96,6 +110,11 @@ def test_resolve_citation_matches_basename_and_relative_path() -> None:
     assert evaluator.resolve_citation("faq.md", known) == "product/faq.md"
     assert evaluator.resolve_citation("./api/auth.md", known) == "api/auth.md"
     assert evaluator.resolve_citation("missing.md", known) is None
+
+
+def test_resolve_citation_accepts_existing_repo_file() -> None:
+    # 与 agent 的引用硬校验一致：仓库内真实存在的文件不算编造
+    assert evaluator.resolve_citation("KNOWLEDGE_SOURCES.md", set()) == "KNOWLEDGE_SOURCES.md"
 
 
 def test_answer_contains_is_whitespace_and_case_insensitive() -> None:

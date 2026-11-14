@@ -117,24 +117,45 @@ def extract_cited_sources(answer: str | None) -> list[str]:
 
 
 def parse_search_results(tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """把 search_docs 的 tool_result 文本解析回结构化结果。"""
+    """把 search_docs 的 tool_result 文本解析回结构化结果（含 chunk 正文）。
+
+    search_docs 的输出形态：
+        [OK] Found N relevant chunk(s) ...
+        [1] score=0.69 source=product/faq.md section=... page=...
+        <chunk 正文>
+        Cite the source ...
+    judge 需要正文才能判断"回答是否被检索结果支撑"，所以这里把正文一起截下来。
+    """
     parsed: list[dict[str, Any]] = []
     for event in tool_results:
         if event.get("name") != "search_docs" or not event.get("success", True):
             continue
-        for line in str(event.get("content") or "").splitlines():
+        current: dict[str, Any] | None = None
+        content_lines: list[str] = []
+        for raw in str(event.get("content") or "").splitlines():
+            line = raw.rstrip()
             match = RESULT_LINE_PATTERN.search(line.strip())
-            if not match:
-                continue
-            parsed.append(
-                {
+            if match:
+                if current is not None:
+                    current["content"] = "\n".join(content_lines).strip()
+                    parsed.append(current)
+                current = {
                     "index": int(match.group("index")),
                     "score": float(match.group("score")),
                     "source": match.group("source").strip(),
                     "section": match.group("section").strip(),
                     "page": int(match.group("page")) if match.group("page") else None,
                 }
-            )
+                content_lines = []
+                continue
+            if current is None:
+                continue
+            if line.strip().startswith("Cite the source"):
+                continue
+            content_lines.append(line)
+        if current is not None:
+            current["content"] = "\n".join(content_lines).strip()
+            parsed.append(current)
     return parsed
 
 
@@ -162,7 +183,11 @@ def normalize_cited_source(cited: str) -> str:
 
 
 def resolve_citation(cited: str, known_sources: set[str]) -> str | None:
-    """把回答里的引用对回知识库路径（都允许只写文件名）。"""
+    """把回答里的引用对回知识库路径（都允许只写文件名）。
+
+    与 agent 里的引用硬校验保持一致：仓库内真实存在的文件也算可核实
+    （例如 KNOWLEDGE_SOURCES.md），只有"哪里都不存在"的路径才算编造。
+    """
     cited_clean = normalize_cited_source(cited).lstrip("./")
     if cited_clean in known_sources:
         return cited_clean
@@ -172,6 +197,8 @@ def resolve_citation(cited: str, known_sources: set[str]) -> str | None:
             return known
         if known.rsplit("/", 1)[-1] == basename:
             return known
+    if cited_clean and (PROJECT_ROOT / cited_clean).is_file():
+        return cited_clean
     return None
 
 
@@ -352,6 +379,19 @@ def aggregate_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
     base["task_mode"] = any(item.get("task_mode") for item in runs)
     base["structured_delivery"] = any(item.get("structured_delivery") for item in runs)
     base["answer"] = runs[-1]["answer"]
+
+    judge_items = [item.get("judge") for item in runs if item.get("judge")]
+    if judge_items:
+        base["judge_faithfulness_avg"] = round(
+            sum(int(item.get("faithfulness") or 0) for item in judge_items) / len(judge_items), 2
+        )
+        base["judge_covers_expected"] = all(bool(item.get("covers_expected")) for item in judge_items)
+        base["judge_cites_ok"] = all(bool(item.get("cites_sources")) for item in judge_items)
+        base["judge_reasons"] = [
+            str(item.get("reason") or "") for item in judge_items if item.get("reason")
+        ]
+    else:
+        base["judge_faithfulness_avg"] = None
     return base
 
 
@@ -375,6 +415,13 @@ def render_console(summary: dict[str, Any]) -> str:
         f"  任务型结构化题数：{summary.get('task_mode_questions', 0)}",
         f"  平均工具调用：{summary['avg_tool_calls']}",
     ]
+    if summary.get("judge_faithfulness_avg") is not None:
+        lines.extend(
+            [
+                f"  裁判忠实度均值（1–5）：{summary['judge_faithfulness_avg']}",
+                f"  裁判覆盖期望率：{summary['judge_covers_expected_rate']:.1%}",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -411,12 +458,23 @@ def render_markdown(
         f"| 无答案承认率 | {summary['no_answer_admit_rate']:.1%} |",
         f"| 任务型结构化题数 | {summary.get('task_mode_questions', 0)} |",
         f"| 平均工具调用 | {summary['avg_tool_calls']} |",
-        "",
-        "## 逐题明细",
-        "",
-        "| 题号 | 类型 | 通过 | 通过次数 | 引用 | 期望来源 | 关键事实 | 检索命中 | 备注 |",
-        "|------|------|------|----------|------|----------|----------|----------|------|",
     ]
+    if summary.get("judge_faithfulness_avg") is not None:
+        lines.extend(
+            [
+                f"| 裁判忠实度均值（1–5） | {summary['judge_faithfulness_avg']} |",
+                f"| 裁判覆盖期望率 | {summary['judge_covers_expected_rate']:.1%} |",
+            ]
+        )
+    judge_on = summary.get("judge_faithfulness_avg") is not None
+    header = "| 题号 | 类型 | 通过 | 通过次数 | 引用 | 期望来源 | 关键事实 | 检索命中 |"
+    separator = "|------|------|------|----------|------|----------|----------|----------|"
+    if judge_on:
+        header += " 裁判忠实度 | 裁判覆盖 |"
+        separator += "------------|----------|"
+    header += " 备注 |"
+    separator += "------|"
+    lines.extend(["", "## 逐题明细", "", header, separator])
     for item in results:
         notes: list[str] = []
         if item.get("flaky"):
@@ -431,8 +489,18 @@ def render_markdown(
             notes.append("结构化交付未带引用")
         if item.get("task_mode") is True:
             notes.append("任务型")
+        judge_cells = ""
+        if judge_on:
+            faithfulness = item.get("judge_faithfulness_avg")
+            covers = item.get("judge_covers_expected")
+            if faithfulness is not None and faithfulness < 4:
+                notes.append(f"裁判低分（{faithfulness}/5）")
+            judge_cells = (
+                f" {('—' if faithfulness is None else str(faithfulness) + '/5')} |"
+                f" {('—' if covers is None else ('✅' if covers else '❌'))} |"
+            )
         lines.append(
-            "| {id} | {type} | {passed} | {count}/{repeat} | {cited} | {expected} | {must} | {hit} | {notes} |".format(
+            "| {id} | {type} | {passed} | {count}/{repeat} | {cited} | {expected} | {must} | {hit} |{judge} {notes} |".format(
                 id=item["id"],
                 type=item["type"],
                 passed="✅" if item["passed"] else "❌",
@@ -442,6 +510,7 @@ def render_markdown(
                 expected="✅" if item["expected_source_cited"] else "❌",
                 must=("—" if item["must_contain_ok"] is None else ("✅" if item["must_contain_ok"] else "❌")),
                 hit=("—" if item["retrieval_hit"] is None else ("✅" if item["retrieval_hit"] else "❌")),
+                judge=judge_cells,
                 notes="; ".join(notes) or "—",
             )
         )
@@ -555,6 +624,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repeat", type=int, default=1, help="每题重复跑几次（默认 1；>1 用于测非确定性）")
     parser.add_argument("--thread-prefix", default="eval-answer", help="每题独立 thread 的前缀")
     parser.add_argument("--judge", action="store_true", help="额外调用 LLM-as-judge（会产生费用）")
+    parser.add_argument("--save-json", type=Path, default=None, help="把 summary + 逐次结果另存为 JSON（便于事后分析）")
     parser.add_argument("--json", action="store_true", help="同时输出 JSON 到 stdout")
     return parser
 
@@ -637,6 +707,13 @@ def main(argv: list[str] | None = None, run_one: RunOne | None = None) -> int:
 
     print(render_console(summary))
     print(f"[OK] 报告：{args.report}")
+    if args.save_json:
+        args.save_json.parent.mkdir(parents=True, exist_ok=True)
+        args.save_json.write_text(
+            json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"[OK] 原始结果：{args.save_json}")
     if args.json:
         print(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
     return 0

@@ -469,6 +469,32 @@ uv run python scripts/eval_answer.py --judge --limit 5    # 额外 LLM-as-judge�
 
 `tests/test_eval_answer.py` 用假事件流覆盖了打分与报告逻辑，不依赖真实模型，可进 CI。
 
+### LLM-as-judge（可选）
+
+`--judge` 会额外用一个低温度裁判模型（默认同为 deepseek-flash，temperature=0、关闭思考）对每次运行打分：
+
+| 字段 | 含义 |
+|---|---|
+| `faithfulness` | 1–5 分，回答是否被本轮检索到的 **chunk 正文**支撑（5 = 完全有据，1 = 与检索内容矛盾或凭空编） |
+| `covers_expected` | 是否覆盖题目期望的关键事实（独立于 `must_contain`，由裁判语义判断） |
+| `cites_sources` | 引用是否真实、不编造 |
+
+裁判输入：题目、类型、`expected_sources`、检索到的 top-6 chunk（`source`/`section`/**正文**）、回答；**不喂 `must_contain`**，避免和规则指标循环论证。报告会多出汇总两行（裁判忠实度均值、覆盖期望率）与逐题两列；`--save-json` 可保存逐次明细，便于事后对比和人工校准：
+
+```bash
+uv run python scripts/eval_answer.py --judge --repeat 3 --report evals/judge_report.md --save-json evals/judge_results.json
+```
+
+当前基线（50 题 × 3 次）：裁判忠实度均值 **4.7 / 5**、覆盖期望率 **96.6%**；同一轮规则指标为通过率 96.7%、严格 92.0%、编造引用 0。
+
+判读时注意三点：
+
+1. **同模型既当考生又当裁判**会偏宽松/自我偏好，建议人工抽 5–10 题校准后再信分数；
+2. **no_answer 题的 `covers_expected` 语义不适用**（题目本来就"没有答案"），当前 rubric 未按 type 区分，判读时只看可回答题；
+3. 裁判看到的是 `search_docs` 截断后的 500 字 chunk，回答里补充的代码/示例可能被判"超出资料"——这恰好暴露了"答案半自产"的问题：本轮 7 次规则 PASS 但裁判 3 分，共性是"结论对，但细节是模型自己补的"；3 次规则 MISS 但裁判高分则全是 no_answer 题的 rubric 错配。
+
+下一步若要继续提升：给 no_answer / multi_hop 写**按 type 区分的 rubric**，并把裁判输入从截断 chunk 换成 `.rag/chunks` 里的完整正文。
+
 ## CLI 命令
 
 ```bash
