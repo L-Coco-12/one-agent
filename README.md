@@ -12,6 +12,8 @@
 - **工具调用可视化**: 显示工具名称、参数、执行结果
 - **中间件链**: 模型重试、工具异常兜底、工具重试、人工审批（HITL）、上下文自动摘要
 - **三层 Skills 加载**: Level 1 元数据注入 → Level 2 指令加载 → Level 3 脚本执行
+- **RAG 知识库**: 文档加载/切分/智谱 embedding/Chroma 检索 + `search_docs` 工具 + 50 题双层评估（规则 + LLM-as-judge）
+- **MCP Server**: 把 `search_docs` 暴露给 Claude Code / Cursor / Codex 等外部 MCP 客户端（stdio / Streamable HTTP）
 
 ## 快速开始
 
@@ -495,6 +497,81 @@ uv run python scripts/eval_answer.py --judge --repeat 3 --report evals/judge_rep
 
 下一步若要继续提升：给 no_answer / multi_hop 写**按 type 区分的 rubric**，并把裁判输入从截断 chunk 换成 `.rag/chunks` 里的完整正文。
 
+## MCP Server（把 search_docs 暴露给外部客户端）
+
+`scripts/mcp_server.py` 把知识库检索包装成一个独立的 **MCP server**，让 Claude Code / Cursor / Codex 等任意 MCP 客户端都能把 `knowledge/` 当工具用。它是"适配壳"：业务逻辑复用 `scripts/search_docs.py` 与 `scripts/build_rag_index.py`，本文件只负责把 Python 函数翻译成 MCP 工具（签名 → JSON Schema、返回值 → 文本）并处理进程边界细节。
+
+```bash
+# stdio 模式（默认；由 MCP 客户端作为子进程拉起，stdout 只能走协议，日志写 stderr）
+uv run python scripts/mcp_server.py
+
+# Streamable HTTP 模式（常驻，默认 127.0.0.1:8101/mcp）
+uv run python scripts/mcp_server.py --http --port 8101
+```
+
+### 客户端配置
+
+```bash
+# Claude Code
+claude mcp add skills-kb -- uv run --directory D:\deepseekcode\skills-agent-proto python scripts/mcp_server.py
+```
+
+```jsonc
+// Cursor / VS Code 的 mcp.json
+{
+  "mcpServers": {
+    "skills-kb": {
+      "command": "uv",
+      "args": ["run", "--directory", "D:\\deepseekcode\\skills-agent-proto", "python", "scripts/mcp_server.py"]
+    }
+  }
+}
+```
+
+```toml
+# Codex CLI: ~/.codex/config.toml
+[mcp_servers.skills-kb]
+command = "uv"
+args = ["run", "--directory", "D:\\deepseekcode\\skills-agent-proto", "python", "scripts/mcp_server.py"]
+tool_timeout_sec = 60
+```
+
+HTTP 模式则把客户端地址填 `http://127.0.0.1:8101/mcp`。
+
+### 工具行为
+
+- 只暴露一个工具 `search_docs(query, top_k=4)`，`top_k` 夹在 1–10。
+- 返回格式与 agent 内置 `search_docs` 一致：`[OK] Found N relevant chunk(s)` + `score/source/section/page` + 正文（截断 500 字符）+ 引用提示。
+- 失败返回 `[FAILED] ...` 文本（含排查提示：起 Chroma、建索引、配置 `ZHIPU_API_KEY`），不会抛协议错误。
+- 只读、无鉴权、无缓存限流；**不是**替代内置工具，只是把同一能力暴露给外部客户端。
+
+### 两个进程边界坑（已在代码里处理）
+
+1. **客户端拉起子进程时会过滤环境变量**，`NO_PROXY` 常被丢掉，httpx 回退到系统代理访问 `127.0.0.1:8100` 会得到 502。`_ensure_local_proxy_bypass()` 在连接 Chroma 前显式把 `localhost,127.0.0.1,::1` 补进 `NO_PROXY/no_proxy`。
+2. **在 FastMCP 工作线程里首次 `import chromadb` 会长时间阻塞**（本机 >90s）。改为在模块加载（主线程、`mcp.run` 之前）预热 `chromadb` 与 `langchain_chroma`，工具调用只剩真正的查询耗时（首次约 1–4s）。
+
+### 验证方式
+
+```bash
+# 单元测试（内存客户端，不需要真 Chroma）
+uv run python -m pytest tests/test_mcp_server.py -q
+
+# stdio 冒烟（列出工具 + 调一次检索）
+uv run python - <<'PY'
+import asyncio
+from fastmcp import Client
+from fastmcp.client.transports import PythonStdioTransport
+async def main():
+    t = PythonStdioTransport(script_path="scripts/mcp_server.py", cwd=".")
+    async with Client(t) as c:
+        print([tool.name for tool in await c.list_tools()])
+        print(str((await c.call_tool("search_docs", {"query": "退货要多久才能退款？"})).content[0].text)[:120])
+asyncio.run(main())
+PY
+```
+
+前提：`docker compose up -d chroma` 与 `uv run python scripts/build_rag_index.py` 已就绪（`knowledge/` 索引进 Chroma）。
+
 ## CLI 命令
 
 ```bash
@@ -584,7 +661,14 @@ skills-agent-proto/
 ├── tests/                # 单元测试
 │   ├── test_stream.py
 │   ├── test_cli.py
-│   └── test_tools.py
+│   ├── test_tools.py
+│   ├── test_agent.py         # provider 路由 / middleware / 意图路由 / HITL / 长期记忆
+│   ├── test_rag_loader.py    # ① 加载与质检
+│   ├── test_rag_splitter.py  # ② 切分
+│   ├── test_rag_tool.py      # ④ search_docs 工具
+│   ├── test_eval_rag.py      # 检索层评估
+│   ├── test_eval_answer.py   # 生成层评估（含 judge）
+│   └── test_mcp_server.py    # MCP server（内存客户端）
 ├── web/                  # React + Vite 前端
 │   └── src/
 │       ├── App.tsx       # 页面壳 + 发送/审批决策编排
@@ -596,12 +680,16 @@ skills-agent-proto/
 │   └── langchain_agent_skill.md
 ├── knowledge/            # RAG 原始资料（进 git，按业务域分目录）
 │   ├── api/
-│   └── product/
+│   ├── product/
+│   ├── fastapi/          # 来自 FastAPI 官方中文文档（MIT）
+│   └── kubernetes/       # 来自 kubernetes/website 中文文档（CC BY 4.0）
+├── KNOWLEDGE_SOURCES.md  # 知识库来源、许可与处理方式（CC BY 4.0 署名）
 ├── evals/                # RAG 评估（阶段 A）
-│   ├── rag_questions.jsonl  # 20 道人工标注题（期望 source / section）
+│   ├── rag_questions.jsonl  # 50 道人工标注题（34 单跳 / 6 多跳 / 10 无答案）
 │   ├── report.md            # eval_rag.py 每次运行生成的指标报告
-│   └── answer_report.md     # eval_answer.py 每次运行生成的生成层报告
-├── scripts/              # RAG 离线脚本
+│   ├── answer_report.md     # eval_answer.py 每次运行生成的生成层报告
+│   └── judge_report.md      # eval_answer.py --judge 的裁判报告（可选）
+├── scripts/              # RAG 离线脚本 + MCP server
 │   ├── rag_loader.py     # ① 加载 + 质检
 │   ├── inspect_docs.py   # ① 命令行入口
 │   ├── rag_splitter.py   # ② 切分
@@ -610,7 +698,8 @@ skills-agent-proto/
 │   ├── build_rag_index.py# ③ 建索引 + manifest（跳过/重建判定）
 │   ├── search_docs.py    # ③ 检索验证
 │   ├── eval_rag.py       # 评估：Hit@k / MRR / Precision / 无答案拒答
-│   └── eval_answer.py    # 评估：引用真实性 / 关键事实 / 无答案承认 / 重复运行
+│   ├── eval_answer.py    # 评估：引用真实性 / 关键事实 / 无答案承认 / 重复运行 / judge
+│   └── mcp_server.py     # MCP server：把 search_docs 暴露给外部客户端（stdio / HTTP）
 ├── docker-compose.yml    # 本地 Chroma 服务（第③步，127.0.0.1:8100）
 ├── .rag/                 # RAG 生成物（gitignore：抽取文本、chunk、向量索引）
 └── .claude/skills/       # 示例 Skills
@@ -679,6 +768,9 @@ uv run python -m pytest tests/ -v
 | `RAG_EMBEDDING_TIMEOUT` | embedding 请求超时（秒） | `30` |
 | `RAG_EMBEDDING_MAX_RETRIES` | 429/5xx 重试次数 | `3` |
 | `RAG_LOW_RELEVANCE_SCORE` | 低相关度兜底阈值：本轮最高检索分低于它时追加"可能未覆盖"提示 | `0.5` |
+| `MCP_HTTP_HOST` | MCP server HTTP 模式监听地址 | `127.0.0.1` |
+| `MCP_HTTP_PORT` | MCP server HTTP 模式端口 | `8101` |
+| `MCP_HTTP_PATH` | MCP server HTTP 模式挂载路径 | `/mcp` |
 
 > 建议优先使用 `MODEL_*` 通用变量；这样在 DeepSeek / Anthropic / OpenAI 之间切换时只需要改 provider、model、base_url。
 
